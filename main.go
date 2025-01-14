@@ -1,16 +1,26 @@
 package main
 
 import (
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
-	"strings"
-	"encoding/json"
-	"sync/atomic"
 	"net/http"
+	"os"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jamistoso/chirpy/internal/database"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
+	dbQueries *database.Queries
+	platform string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -30,16 +40,129 @@ func (cfg *apiConfig) metricsHandler(rWriter http.ResponseWriter, rq *http.Reque
 }
 
 func (cfg *apiConfig) resetHandler(rWriter http.ResponseWriter, rq *http.Request) {
+
+	if cfg.platform != "dev" {
+		respondWithError(rWriter, 403, "reset attempted on non-dev platform")
+		return
+	}
+	cfg.dbQueries.Reset(rq.Context())
 	fmt.Println("Reset")
 	cfg.fileserverHits.Store(0)
-	rWriter.Write([]byte("File server hits reset to 0"))
+	respondWithJSON(rWriter, 200, "File server hits reset to 0")
+}
+
+func (cfg *apiConfig) usersHandler(rWriter http.ResponseWriter, rq *http.Request) {
+	type parameters struct {
+		Email string `json:"email"`
+	}
+
+	decoder := json.NewDecoder(rq.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(rWriter, 500, "Error decoding parameters")
+		return
+	}
+
+	dbUser, err := cfg.dbQueries.CreateUser(rq.Context(), params.Email,)
+	if err != nil {
+		respondWithError(rWriter, 500, "Error creating user")
+		return
+	}
+
+	type returnVals struct {
+		Id 			uuid.UUID	`json:"id"`
+		Created_at 	time.Time 	`json:"created_at"`
+		Updated_at 	time.Time 	`json:"updated_at"`
+		Email		string		`json:"email"`
+	}
+
+	respBody := returnVals{
+		Id:			dbUser.ID,
+		Created_at: dbUser.CreatedAt,
+		Updated_at: dbUser.UpdatedAt,
+		Email:		dbUser.Email,
+	}
+	
+	respondWithJSON(rWriter, 201, respBody)
+}
+
+func (cfg *apiConfig) chirpsHandler(rWriter http.ResponseWriter, rq *http.Request) {
+	type parameters struct {
+		Body 	string `json:"body"`
+		User_id uuid.UUID `json:"user_id"`
+	}
+
+	decoder := json.NewDecoder(rq.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(rWriter, 500, "Error decoding parameters")
+		return
+	}
+
+	if len(params.Body) > 140 {
+		respondWithError(rWriter, 400, "Chirp is too long")
+		return
+	}
+
+	params.Body = profanityFilter(params.Body)
+
+	chirp, err := cfg.dbQueries.CreateChirp(rq.Context(), database.CreateChirpParams{
+		Body: params.Body,
+		UserID: uuid.NullUUID{
+			UUID: params.User_id,
+			Valid: true,
+		},
+	})
+
+	if err != nil {
+		respondWithError(rWriter, 500, "Error creating chirp")
+		return
+	}
+
+	type returnVals struct {
+		ID 			uuid.UUID	`json:"id"`
+		Created_at 	time.Time 	`json:"created_at"`
+		Updated_at	time.Time	`json:"updated_at"`
+		Body		string		`json:"body"`
+		User_id		uuid.UUID	`json:"user_id"`
+	}
+
+	respBody := returnVals{
+		ID: 		chirp.ID,
+		Created_at: chirp.CreatedAt,
+		Updated_at: chirp.UpdatedAt,
+		Body: 		chirp.Body,
+		User_id: 	chirp.UserID.UUID,
+	}
+	
+	respondWithJSON(rWriter, 201, respBody)
 }
 
 func main() {
+	err := godotenv.Load()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	serveMux := http.NewServeMux()
+
+	dbURL := os.Getenv("DB_URL")
+	db, err := sql.Open("postgres", dbURL)
+	
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	dbQueries := database.New(db)
+	platform := os.Getenv("PLATFORM")
 
 	apiCfg := &apiConfig{
 		fileserverHits:	atomic.Int32{},
+		dbQueries: 		dbQueries,
+		platform:		platform,	
 	}
 	serveHandler := http.StripPrefix("/app", http.FileServer(http.Dir(".")))
 	serveMux.Handle("/app/", apiCfg.middlewareMetricsInc(serveHandler))
@@ -51,40 +174,9 @@ func main() {
 	}
 	serveMux.HandleFunc("GET /api/healthz", healthHandler)
 
-	validateHandler := func(rWriter http.ResponseWriter, rq *http.Request) {
-		type parameters struct {
-			Body string `json:"body"`
-		}
-	
-		decoder := json.NewDecoder(rq.Body)
-		params := parameters{}
-		err := decoder.Decode(&params)
-		if err != nil {
-			respondWithError(rWriter, 500, "Error decoding parameters")
-			return
-		}
+	serveMux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler)
 
-		if len(params.Body) > 140 {
-			respondWithError(rWriter, 400, "Chirp is too long")
-			return
-		}
-
-		params.Body = profanityFilter(params.Body)
-
-		type returnVals struct {
-			Valid bool			`json:"valid"`
-			Cleaned_body string `json:"cleaned_body"`
-		}
-
-		respBody := returnVals{
-			Valid: true,
-			Cleaned_body: params.Body,
-		}
-		
-		respondWithJSON(rWriter, 200, respBody)
-	}
-
-	serveMux.HandleFunc("POST /api/validate_chirp", validateHandler)
+	serveMux.HandleFunc("POST /api/users", apiCfg.usersHandler)
 
 	serveMux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	
