@@ -12,15 +12,17 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jamistoso/chirpy/internal/auth"
 	"github.com/jamistoso/chirpy/internal/database"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
 
 type apiConfig struct {
-	fileserverHits atomic.Int32
-	dbQueries *database.Queries
-	platform string
+	fileserverHits 	atomic.Int32
+	dbQueries 		*database.Queries
+	platform 		string
+	jwtSecret 		string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -53,18 +55,29 @@ func (cfg *apiConfig) resetHandler(rWriter http.ResponseWriter, rq *http.Request
 
 func (cfg *apiConfig) usersHandler(rWriter http.ResponseWriter, rq *http.Request) {
 	type parameters struct {
-		Email string `json:"email"`
+		Password 	string `json:"password"`
+		Email 		string `json:"email"`
 	}
 
 	decoder := json.NewDecoder(rq.Body)
-	params := parameters{}
-	err := decoder.Decode(&params)
+	rqParams := parameters{}
+	err := decoder.Decode(&rqParams)
 	if err != nil {
 		respondWithError(rWriter, 500, "Error decoding parameters")
 		return
 	}
 
-	dbUser, err := cfg.dbQueries.CreateUser(rq.Context(), params.Email,)
+	hashPass, err := auth.HashPassword(rqParams.Password)
+	if err != nil {
+		respondWithError(rWriter, 500, "Error hashing password")
+	}
+
+	userParams := database.CreateUserParams{
+		Email:			rqParams.Email,
+		HashedPassword: hashPass,
+	}
+
+	dbUser, err := cfg.dbQueries.CreateUser(rq.Context(), userParams)
 	if err != nil {
 		respondWithError(rWriter, 500, "Error creating user")
 		return
@@ -87,31 +100,98 @@ func (cfg *apiConfig) usersHandler(rWriter http.ResponseWriter, rq *http.Request
 	respondWithJSON(rWriter, 201, respBody)
 }
 
-func (cfg *apiConfig) chirpsHandler(rWriter http.ResponseWriter, rq *http.Request) {
+func (cfg *apiConfig) loginHandler(rWriter http.ResponseWriter, rq *http.Request) {
 	type parameters struct {
-		Body 	string `json:"body"`
-		User_id uuid.UUID `json:"user_id"`
+		Password 			string 	`json:"password"`
+		Email 				string 	`json:"email"`
+		ExpiresInSeconds 	int		`json:"expires_in_seconds"`
+	}
+
+	decoder := json.NewDecoder(rq.Body)
+	rqParams := parameters{}
+	err := decoder.Decode(&rqParams)
+	if err != nil {
+		respondWithError(rWriter, 500, "error decoding parameters")
+		return
+	}
+	fmt.Println(rqParams.ExpiresInSeconds)
+	if rqParams.ExpiresInSeconds == 0 || rqParams.ExpiresInSeconds > (60 * 60) {
+		rqParams.ExpiresInSeconds = (60 * 60)
+	}
+
+	dbUser, err := cfg.dbQueries.GetUserFromEmail(rq.Context(), rqParams.Email)
+	if err != nil {
+		respondWithError(rWriter, 500, "error creating user")
+		return
+	}
+
+	err = auth.CheckPasswordHash(rqParams.Password, dbUser.HashedPassword)
+	if err != nil {
+		respondWithError(rWriter, 401, "incorrect email or password")
+		return
+	}
+
+	jwtToken, err := auth.MakeJWT(dbUser.ID, cfg.jwtSecret, time.Duration(rqParams.ExpiresInSeconds) * time.Second)
+	if err != nil {
+		respondWithError(rWriter, 500, "jwt token creation failed")
+		return
+	}
+
+	type returnVals struct {
+		Id 			uuid.UUID	`json:"id"`
+		Created_at 	time.Time 	`json:"created_at"`
+		Updated_at 	time.Time 	`json:"updated_at"`
+		Email		string		`json:"email"`
+		Token		string		`json:"token"`
+	}
+
+	respBody := returnVals{
+		Id:			dbUser.ID,
+		Created_at: dbUser.CreatedAt,
+		Updated_at: dbUser.UpdatedAt,
+		Email:		dbUser.Email,
+		Token:		jwtToken,
+	}
+	
+	respondWithJSON(rWriter, 200, respBody)
+}
+
+func (cfg *apiConfig) postChirpsHandler(rWriter http.ResponseWriter, rq *http.Request) {
+	type parameters struct {
+		Body 	string 		`json:"body"`
 	}
 
 	decoder := json.NewDecoder(rq.Body)
 	params := parameters{}
 	err := decoder.Decode(&params)
 	if err != nil {
-		respondWithError(rWriter, 500, "Error decoding parameters")
+		respondWithError(rWriter, 500, "error decoding parameters")
 		return
 	}
 
 	if len(params.Body) > 140 {
-		respondWithError(rWriter, 400, "Chirp is too long")
+		respondWithError(rWriter, 400, "chirp is too long")
 		return
 	}
 
 	params.Body = profanityFilter(params.Body)
 
+	jwtToken, err := auth.GetBearerToken(rq.Header)
+	if err != nil {
+		respondWithError(rWriter, 401, err.Error())
+		return
+	}
+
+	authID, err := auth.ValidateJWT(jwtToken, cfg.jwtSecret)
+	if err != nil{
+		respondWithError(rWriter, 401, err.Error())
+		return
+	}
+
 	chirp, err := cfg.dbQueries.CreateChirp(rq.Context(), database.CreateChirpParams{
 		Body: params.Body,
 		UserID: uuid.NullUUID{
-			UUID: params.User_id,
+			UUID: authID,
 			Valid: true,
 		},
 	})
@@ -140,6 +220,74 @@ func (cfg *apiConfig) chirpsHandler(rWriter http.ResponseWriter, rq *http.Reques
 	respondWithJSON(rWriter, 201, respBody)
 }
 
+func (cfg *apiConfig) getAllChirpsHandler(rWriter http.ResponseWriter, rq *http.Request) {
+
+	type returnVals struct {
+		ID 			uuid.UUID	`json:"id"`
+		Created_at 	time.Time 	`json:"created_at"`
+		Updated_at	time.Time	`json:"updated_at"`
+		Body		string		`json:"body"`
+		User_id		uuid.UUID	`json:"user_id"`
+	}
+
+
+	chirps, err := cfg.dbQueries.GetAllChirps(rq.Context())
+	if err != nil {
+		respondWithError(rWriter, 500, "Error retrieving chirps")
+		return
+	}
+
+	
+	var returnArr []returnVals
+
+	for _, chirp := range chirps {
+		respBody := returnVals{
+			ID: 		chirp.ID,
+			Created_at: chirp.CreatedAt,
+			Updated_at: chirp.UpdatedAt,
+			Body: 		chirp.Body,
+			User_id: 	chirp.UserID.UUID,
+		}
+		returnArr = append(returnArr, respBody)
+	}
+
+	respondWithJSON(rWriter, 200, returnArr)
+}
+
+func (cfg *apiConfig) getOneChirpHandler(rWriter http.ResponseWriter, rq *http.Request) {
+	
+	id := rq.PathValue("chirpID")
+	chirpId, err := uuid.Parse(id)
+	if err != nil {
+		respondWithError(rWriter, 500, "Error parsing chirp id")
+		return
+	}
+	
+	chirp, err := cfg.dbQueries.GetOneChirp(rq.Context(), chirpId)
+	if err != nil {
+		respondWithError(rWriter, 404, "No chirp found")
+		return
+	}
+
+	type returnVals struct {
+		ID 			uuid.UUID	`json:"id"`
+		Created_at 	time.Time 	`json:"created_at"`
+		Updated_at	time.Time	`json:"updated_at"`
+		Body		string		`json:"body"`
+		User_id		uuid.UUID	`json:"user_id"`
+	}
+
+	respBody := returnVals{
+		ID: 		chirp.ID,
+		Created_at: chirp.CreatedAt,
+		Updated_at: chirp.UpdatedAt,
+		Body: 		chirp.Body,
+		User_id: 	chirp.UserID.UUID,
+	}
+
+	respondWithJSON(rWriter, 200, respBody)
+}
+
 func main() {
 	err := godotenv.Load()
 	if err != nil {
@@ -158,11 +306,13 @@ func main() {
 
 	dbQueries := database.New(db)
 	platform := os.Getenv("PLATFORM")
+	jwtSecret := os.Getenv("JWT_SECRET")
 
 	apiCfg := &apiConfig{
 		fileserverHits:	atomic.Int32{},
 		dbQueries: 		dbQueries,
-		platform:		platform,	
+		platform:		platform,
+		jwtSecret: 		jwtSecret,	
 	}
 	serveHandler := http.StripPrefix("/app", http.FileServer(http.Dir(".")))
 	serveMux.Handle("/app/", apiCfg.middlewareMetricsInc(serveHandler))
@@ -174,9 +324,15 @@ func main() {
 	}
 	serveMux.HandleFunc("GET /api/healthz", healthHandler)
 
-	serveMux.HandleFunc("POST /api/chirps", apiCfg.chirpsHandler)
+	serveMux.HandleFunc("GET /api/chirps", apiCfg.getAllChirpsHandler)
+
+	serveMux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getOneChirpHandler)
+
+	serveMux.HandleFunc("POST /api/chirps", apiCfg.postChirpsHandler)
 
 	serveMux.HandleFunc("POST /api/users", apiCfg.usersHandler)
+
+	serveMux.HandleFunc("POST /api/login", apiCfg.loginHandler)
 
 	serveMux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	
@@ -191,9 +347,13 @@ func main() {
 }
 
 func respondWithError(rWriter http.ResponseWriter, code int, msg string) {
-	rWriter.Header().Set("Content-Type", "application/json")
-	rWriter.WriteHeader(code)
-	rWriter.Write([]byte(msg))
+	type errorStruct struct{
+		Error string `json:"error"`
+	}
+	eStruct := errorStruct {
+		Error: msg,
+	}
+	respondWithJSON(rWriter, code, eStruct)
 }
 
 func respondWithJSON(rWriter http.ResponseWriter, code int, payload interface{}) {
