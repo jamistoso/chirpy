@@ -353,6 +353,111 @@ func (cfg *apiConfig) getOneChirpHandler(rWriter http.ResponseWriter, rq *http.R
 	respondWithJSON(rWriter, 200, respBody)
 }
 
+func (cfg *apiConfig) deleteOneChirpHandler(rWriter http.ResponseWriter, rq *http.Request) {
+	
+
+	jwtToken, err := auth.GetBearerToken(rq.Header)
+	if err != nil {
+		respondWithError(rWriter, 401, err.Error())
+		return
+	}
+
+	authID, err := auth.ValidateJWT(jwtToken, cfg.jwtSecret)
+	if err != nil{
+		respondWithError(rWriter, 401, err.Error())
+		return
+	}
+
+	id := rq.PathValue("chirpID")
+	chirpId, err := uuid.Parse(id)
+	if err != nil {
+		respondWithError(rWriter, 500, "error parsing chirp id")
+		return
+	}
+
+	chirp, err := cfg.dbQueries.GetOneChirp(rq.Context(), chirpId)
+	if err != nil {
+		respondWithError(rWriter, 404, "chirp not found")
+		return
+	}
+	println(chirp.UserID.UUID.String() + " " + authID.String())
+
+	if chirp.UserID.UUID != authID {
+		respondWithError(rWriter, 403, "unauthorized user")
+		return
+	}
+
+	err = cfg.dbQueries.DeleteChirp(rq.Context(), chirp.ID)
+	if err != nil {
+		respondWithError(rWriter, 500, "error deleting chirp")
+		return
+	}
+
+	respondWithJSON(rWriter, 204, nil)
+}
+
+func (cfg *apiConfig) usersPutHandler(rWriter http.ResponseWriter, rq *http.Request) {
+	type parameters struct {
+		Password 	string `json:"password"`
+		Email 		string `json:"email"`
+	}
+
+	
+	jwtToken, err := auth.GetBearerToken(rq.Header)
+	if err != nil {
+		respondWithError(rWriter, 401, err.Error())
+		return
+	}
+
+	authID, err := auth.ValidateJWT(jwtToken, cfg.jwtSecret)
+	if err != nil{
+		respondWithError(rWriter, 401, err.Error())
+		return
+	}
+
+	decoder := json.NewDecoder(rq.Body)
+	rqParams := parameters{}
+	err = decoder.Decode(&rqParams)
+	if err != nil {
+		respondWithError(rWriter, 500, "error decoding parameters")
+		return
+	}
+
+	hashPass, err := auth.HashPassword(rqParams.Password)
+	if err != nil {
+		respondWithError(rWriter, 500, "error hashing password")
+		return
+	}
+
+	dbParams := database.UpdatePasswordAndEmailParams{
+		HashedPassword: hashPass,
+		Email:			rqParams.Email,
+		ID:				authID,
+	}
+
+	dbUser, err := cfg.dbQueries.UpdatePasswordAndEmail(rq.Context(), dbParams)
+	if err != nil {
+		respondWithError(rWriter, 500, "error updating password and email")
+		return
+	}
+
+	type returnVals struct {
+		Id 			uuid.UUID	`json:"id"`
+		Created_at 	time.Time 	`json:"created_at"`
+		Updated_at 	time.Time 	`json:"updated_at"`
+		Email		string		`json:"email"`
+	}
+
+	respBody := returnVals{
+		Id:			dbUser.ID,
+		Created_at: dbUser.CreatedAt,
+		Updated_at: dbUser.UpdatedAt,
+		Email:		dbUser.Email,
+	}
+	
+	respondWithJSON(rWriter, 200, respBody)
+}
+
 func main() {
 	err := godotenv.Load()
 	if err != nil {
@@ -392,10 +497,14 @@ func main() {
 	serveMux.HandleFunc("GET /api/chirps", apiCfg.getAllChirpsHandler)
 
 	serveMux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getOneChirpHandler)
+	
+	serveMux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.deleteOneChirpHandler)
 
 	serveMux.HandleFunc("POST /api/chirps", apiCfg.postChirpsHandler)
 
 	serveMux.HandleFunc("POST /api/users", apiCfg.usersHandler)
+
+	serveMux.HandleFunc("PUT /api/users", apiCfg.usersPutHandler)
 
 	serveMux.HandleFunc("POST /api/login", apiCfg.loginHandler)
 

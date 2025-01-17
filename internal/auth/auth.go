@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"crypto/rand"
-	"strconv"
 	"strings"
 	"time"
 
@@ -79,10 +78,10 @@ func GetBearerToken(headers http.Header) (string, error) {
 
 func MakeRefreshToken() (string, error) {
 	b := make([]byte, 32)
-	randToken, err := rand.Read(b)
+	_, err := rand.Read(b)
 	if err != nil {
 		return "", err
 	}
-	refToken := hex.EncodeToString([]byte(strconv.Itoa(randToken)))
+	refToken := hex.EncodeToString(b)
 	return refToken, nil
 }
