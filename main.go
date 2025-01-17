@@ -104,7 +104,6 @@ func (cfg *apiConfig) loginHandler(rWriter http.ResponseWriter, rq *http.Request
 	type parameters struct {
 		Password 			string 	`json:"password"`
 		Email 				string 	`json:"email"`
-		ExpiresInSeconds 	int		`json:"expires_in_seconds"`
 	}
 
 	decoder := json.NewDecoder(rq.Body)
@@ -113,10 +112,6 @@ func (cfg *apiConfig) loginHandler(rWriter http.ResponseWriter, rq *http.Request
 	if err != nil {
 		respondWithError(rWriter, 500, "error decoding parameters")
 		return
-	}
-	fmt.Println(rqParams.ExpiresInSeconds)
-	if rqParams.ExpiresInSeconds == 0 || rqParams.ExpiresInSeconds > (60 * 60) {
-		rqParams.ExpiresInSeconds = (60 * 60)
 	}
 
 	dbUser, err := cfg.dbQueries.GetUserFromEmail(rq.Context(), rqParams.Email)
@@ -131,29 +126,99 @@ func (cfg *apiConfig) loginHandler(rWriter http.ResponseWriter, rq *http.Request
 		return
 	}
 
-	jwtToken, err := auth.MakeJWT(dbUser.ID, cfg.jwtSecret, time.Duration(rqParams.ExpiresInSeconds) * time.Second)
+	jwtToken, err := auth.MakeJWT(dbUser.ID, cfg.jwtSecret, time.Duration(1) * time.Hour)
+	if err != nil {
+		respondWithError(rWriter, 500, "jwt token creation failed")
+		return
+	}
+
+	refreshToken, err := auth.MakeRefreshToken()
+	if err != nil {
+		respondWithError(rWriter, 500, "refresh token creation failed")
+		return
+	}
+
+	refreshExpirationTime := time.Now().Add(time.Duration(60) * time.Hour * 24)
+
+	params := database.CreateRefreshTokenParams{
+		Token:	refreshToken,
+		UserID:	uuid.NullUUID{
+			UUID:	dbUser.ID,
+			Valid:	true,
+		},
+		ExpiresAt: refreshExpirationTime,
+	}
+
+	_, err = cfg.dbQueries.CreateRefreshToken(rq.Context(), params)
+	if err != nil {
+		respondWithError(rWriter, 500, err.Error())
+		return
+	}
+
+	type returnVals struct {
+		Id 					uuid.UUID	`json:"id"`
+		Created_at 			time.Time 	`json:"created_at"`
+		Updated_at 			time.Time 	`json:"updated_at"`
+		Email				string		`json:"email"`
+		Token				string		`json:"token"`
+		Refresh_token		string		`json:"refresh_token"`
+	}
+
+	respBody := returnVals{
+		Id:					dbUser.ID,
+		Created_at: 		dbUser.CreatedAt,
+		Updated_at: 		dbUser.UpdatedAt,
+		Email:				dbUser.Email,
+		Token:				jwtToken,
+		Refresh_token:		refreshToken,
+	}
+	
+	respondWithJSON(rWriter, 200, respBody)
+}
+
+func (cfg *apiConfig) refreshHandler(rWriter http.ResponseWriter, rq *http.Request) {
+	refreshToken, err := auth.GetBearerToken(rq.Header)
+	if err != nil {
+		respondWithError(rWriter, 401, err.Error())
+	}
+
+	dbToken, err := cfg.dbQueries.GetUserFromRefreshToken(rq.Context(), refreshToken)
+	if err != nil {
+		respondWithError(rWriter, 401, err.Error())
+	}
+	if dbToken.RevokedAt.Valid {
+		respondWithError(rWriter, 401, "invalid refresh token")
+	}
+
+	jwtToken, err := auth.MakeJWT(dbToken.UserID.UUID, cfg.jwtSecret, time.Duration(1) * time.Hour)
 	if err != nil {
 		respondWithError(rWriter, 500, "jwt token creation failed")
 		return
 	}
 
 	type returnVals struct {
-		Id 			uuid.UUID	`json:"id"`
-		Created_at 	time.Time 	`json:"created_at"`
-		Updated_at 	time.Time 	`json:"updated_at"`
-		Email		string		`json:"email"`
-		Token		string		`json:"token"`
+		Token	string	`json:"token"`
 	}
 
 	respBody := returnVals{
-		Id:			dbUser.ID,
-		Created_at: dbUser.CreatedAt,
-		Updated_at: dbUser.UpdatedAt,
-		Email:		dbUser.Email,
-		Token:		jwtToken,
+		Token:	jwtToken,
+	}
+
+	respondWithJSON(rWriter, 200, respBody)
+}
+
+func (cfg *apiConfig) revokeHandler(rWriter http.ResponseWriter, rq *http.Request) {
+	refreshToken, err := auth.GetBearerToken(rq.Header)
+	if err != nil {
+		respondWithError(rWriter, 401, err.Error())
+	}
+
+	err = cfg.dbQueries.RevokeRefreshToken(rq.Context(), refreshToken)
+	if err != nil {
+		respondWithError(rWriter, 500, err.Error())
 	}
 	
-	respondWithJSON(rWriter, 200, respBody)
+	respondWithJSON(rWriter, 204, nil)
 }
 
 func (cfg *apiConfig) postChirpsHandler(rWriter http.ResponseWriter, rq *http.Request) {
@@ -334,6 +399,10 @@ func main() {
 
 	serveMux.HandleFunc("POST /api/login", apiCfg.loginHandler)
 
+	serveMux.HandleFunc("POST /api/refresh", apiCfg.refreshHandler)
+
+	serveMux.HandleFunc("POST /api/revoke", apiCfg.revokeHandler)
+
 	serveMux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	
 	serveMux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
@@ -357,6 +426,10 @@ func respondWithError(rWriter http.ResponseWriter, code int, msg string) {
 }
 
 func respondWithJSON(rWriter http.ResponseWriter, code int, payload interface{}) {
+	if payload == nil {
+		rWriter.WriteHeader(code)
+		return
+	}
 	dat, err := json.Marshal(payload)
 	if err != nil {
 			log.Printf("Error marshalling JSON: %s", err)

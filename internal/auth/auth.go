@@ -1,10 +1,13 @@
 package auth
 
 import (
+	"encoding/hex"
 	"fmt"
+	"net/http"
+	"crypto/rand"
+	"strconv"
 	"strings"
 	"time"
-	"net/http"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -72,4 +75,14 @@ func GetBearerToken(headers http.Header) (string, error) {
 		return "", fmt.Errorf("no bearer token found in headers")
 	}
 	return strings.TrimPrefix(bearer, "Bearer "), nil
+}
+
+func MakeRefreshToken() (string, error) {
+	b := make([]byte, 32)
+	randToken, err := rand.Read(b)
+	if err != nil {
+		return "", err
+	}
+	refToken := hex.EncodeToString([]byte(strconv.Itoa(randToken)))
+	return refToken, nil
 }
